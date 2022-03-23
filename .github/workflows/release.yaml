@@ -1,0 +1,110 @@
+name: Build & Release 
+
+# build only on push to master branch
+on:
+  push:
+    branches: 
+    - main
+  schedule:
+    - cron:  '0 1 * * *'
+
+jobs:
+
+  job1:
+    name: Build Docker image
+    runs-on: ubuntu-20.04
+    outputs:
+      run-id: ${{ steps.generate-uuid.outputs.run-id }}
+
+    steps:
+
+      # Stage1 Prepare and Build
+      # Generate uuid, which is used in POD in LABELS and as label
+      -
+        id: generate-uuid
+        run: echo "::set-output name=run-id::$(date '+%H%M%S')"
+
+  job2:
+    needs: job1
+    name: Run Smoke in K8s
+    runs-on: ubuntu-20.04
+
+    steps:
+    
+      # Clone this repository
+      -
+        name: Checkout Git repository
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+      
+      # Kubeconfig is stored in Github secret as base64 string
+      - 
+        name: Store K8s config
+        run: echo $KUBE_CONFIG_BASE64 | base64 -d > kube-config.yaml
+        shell: bash
+        env:
+          KUBE_CONFIG_BASE64 : ${{secrets.KUBE_CONFIG_BASE64}}
+      - uses: azure/setup-kubectl@v1
+        with:
+          version: 'latest'
+        id: install
+      -
+        name: List directory
+        run: ls -lah
+      -
+        name: Grant permission
+        run: chmod +x k8s-cicd/pipeline.sh
+        
+      # Run in Kubernetes
+      -
+        name: Run pipeline.sh
+        run: k8s-cicd/pipeline.sh
+        shell: bash
+        env:
+          CANARYTRACE_LICENSE : ${{secrets.CANARY_LICENSE}}
+          CANARY_IMAGE : ${{secrets.CANARY_IMAGE}}
+          ELASTIC_CLUSTER : ${{secrets.ELASTIC_CLUSTER}}
+          ELASTIC_HTTP_AUTH : ${{secrets.ELASTIC_HTTP_AUTH}}
+          RUN_ID: ${{needs.job1.outputs.run-id}}
+          LABELS: "run-id-smoke-${{needs.job1.outputs.run-id}}"
+          BASE_URL: ${{secrets.BASE_URL}}
+          NAMESPACE: ${{secrets.NAMESPACE}}
+  job3:
+    needs: [job1, job2]
+    name: Check data from Canarytrace
+    runs-on: ubuntu-20.04
+    steps:
+      - 
+        name: Elasticsearch healthcheck
+        run: until [ "$(curl -s --user ${{secrets.ELASTIC_HTTP_AUTH}} '${{secrets.ELASTIC_CLUSTER}}/_cat/health?h=status')" = "green" ]; do printf "."; done
+        timeout-minutes: 2
+      -
+        name: Test index c.report-* contains exactly 6 documents
+        run: until (($(curl -s --user ${{secrets.ELASTIC_HTTP_AUTH}} '${{secrets.ELASTIC_CLUSTER}}/c.report-*/_count?q=labels:"run-id-smoke-${{needs.job1.outputs.run-id}}"' | jq -r ".count") == 6 )); do printf "."; done
+        timeout-minutes: 2
+      -
+        name: Test index c.audit-* contains exactly 1 document
+        run: until (($(curl -s --user ${{secrets.ELASTIC_HTTP_AUTH}} '${{secrets.ELASTIC_CLUSTER}}/c.audit-*/_count?q=labels:"run-id-smoke-${{needs.job1.outputs.run-id}}"' | jq -r ".count") == 1 )); do printf "."; done
+        timeout-minutes: 2
+  job4:
+    needs: [job1, job2]
+    name: Check performance budgets
+    runs-on: ubuntu-20.04
+    steps:
+      -
+        name: Performance Score more than 30% score
+        run: until (($(curl -s --user ${{secrets.ELASTIC_HTTP_AUTH}} '${{secrets.ELASTIC_CLUSTER}}/c.audit-*/_search' -H 'Content-Type:application/json' -d '{"_source":["categories.performance.score"],"query":{ "bool":{ "must":[{ "match_phrase":{ "labels":"run-id-smoke-${{needs.job1.outputs.run-id}}"}}]}}}' | jq -r ".hits.hits[0]._source.categories.performance.score") > 30 )); do printf "."; done
+        timeout-minutes: 1
+      -
+        name: TTI is less than 2000ms
+        run: until (($(curl -s --user ${{secrets.ELASTIC_HTTP_AUTH}} '${{secrets.ELASTIC_CLUSTER}}/c.audit-*/_search' -H 'Content-Type:application/json' -d '{"_source":["categories.performance.score"],"query":{ "bool":{ "must":[{ "match_phrase":{ "labels":"run-id-smoke-${{needs.job1.outputs.run-id}}"}}]}}}' | jq -r ".hits.hits[0]._source.audits.interactive.numericValue") < 4000 )); do printf "."; done
+        timeout-minutes: 1
+  job5:
+    needs: [job4, job3]
+    name: Continue
+    runs-on: ubuntu-20.04
+    steps:
+      -
+        name: Continue
+        run: echo "your code"
